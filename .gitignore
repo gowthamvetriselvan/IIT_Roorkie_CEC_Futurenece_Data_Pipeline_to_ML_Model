@@ -12,4 +12,13 @@ airflow.cfg
 airflow.db
 .astro/*.local.yml
 .astro/*.local.yaml
-test_api.py 
+test_api.py
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated NammaMart ETL outputs
+include/output/nammamart/
+include/output/nammamart_elt/

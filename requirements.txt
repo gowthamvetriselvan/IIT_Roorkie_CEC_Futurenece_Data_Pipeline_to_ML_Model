@@ -14,3 +14,5 @@ apache-airflow-providers-slack
 cryptography==46.0.7
 pyOpenSSL==25.3.0
 asyncssh==2.21.1
+
+pyarrow>=23,<25
