@@ -6,7 +6,7 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
-
+from include.nammamart.scd2 import apply_customer_loyalty_scd2
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_DIR = PROJECT_ROOT / "include" / "data" / "nammamart"
@@ -585,6 +585,7 @@ def run_elt(run_id: str | None = None) -> dict:
         # current-run temporary source tables remain available.
         from include.nammamart.sql_runner import execute_sql_files
 
+
         execute_sql_files(
             con,
             [
@@ -596,8 +597,17 @@ def run_elt(run_id: str | None = None) -> dict:
                 "06_mart_category_margin.sql",
                 "07_mart_delivery_sla.sql",
                 "08_mart_top_customers.sql",
+                "09_mart_store_capacity.sql",
             ],
         )
+
+        # Maintain customer loyalty-tier history after curated tables exist.
+        scd2_summary = apply_customer_loyalty_scd2(
+            con,
+            source_table="customers_curated",
+        )
+        logging.info("ELT customer SCD2 summary: %s", scd2_summary)
+        results["customer_scd2"] = scd2_summary
 
         # Export the final SQL staging and quarantine tables.
         datasets = [
@@ -607,6 +617,7 @@ def run_elt(run_id: str | None = None) -> dict:
             ("orders", "stg_orders", "orders_quarantine", "order_id"),
             ("payments", "stg_payments", "payments_quarantine", "payment_id"),
         ]
+
 
         report_rows = []
 

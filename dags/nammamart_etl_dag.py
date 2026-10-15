@@ -22,7 +22,7 @@ from include.nammamart.etl_warehouse import (
     load_etl_star_schema,
 )
 from include.nammamart.reconciliation import get_source_reconciliation_metrics
-
+from include.nammamart.notifications import notify_pipeline_failure
 
 EXTRACT_DIR = OUTPUT_DIR.parent / "etl_extracts"
 
@@ -68,6 +68,7 @@ def _extract_group(run_id: str, filenames: list[str]) -> dict:
         "retries": 2,
         "retry_delay": timedelta(minutes=5),
         "execution_timeout": timedelta(minutes=30),
+        "on_failure_callback": notify_pipeline_failure,
     },
     tags=["nammamart", "etl", "data-quality", "duckdb"],
 )
@@ -233,11 +234,16 @@ def nammamart_etl_pipeline():
             report_results["daily_zone_revenue_sample"],
         )
         logging.info("ETL category margin report: %s", report_results["category_margin"])
+        logging.info(
+            "ETL store capacity sample: %s",
+            report_results["store_capacity_sample"],
+        )
         return {
             "run_id": run_info["run_id"],
             "report_table_counts": report_results["table_counts"],
             "daily_zone_revenue_sample_rows": len(report_results["daily_zone_revenue_sample"]),
             "category_margin_rows": len(report_results["category_margin"]),
+            "store_capacity_sample_rows": len(report_results["store_capacity_sample"]),
         }
 
     @task

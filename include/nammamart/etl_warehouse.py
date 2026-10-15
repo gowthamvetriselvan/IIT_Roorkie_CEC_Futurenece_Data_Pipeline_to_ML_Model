@@ -12,7 +12,7 @@ from typing import Any
 
 import duckdb
 import pandas as pd
-
+from include.nammamart.scd2 import apply_customer_loyalty_scd2
 from include.nammamart.etl import OUTPUT_DIR
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +59,11 @@ def _create_table(con: duckdb.DuckDBPyConnection, table_name: str, frame: pd.Dat
 
 def load_etl_star_schema(run_id: str) -> dict[str, int]:
     """Create/update ETL dimensions and fact from validated curated outputs."""
+    scd2_summary = {
+    "history_rows": 0,
+    "current_customers": 0,
+    "historical_versions": 0,
+    }
     customers = pd.read_parquet(OUTPUT_DIR / "customers.parquet").copy()
     products = pd.read_parquet(OUTPUT_DIR / "products.parquet").copy()
     stores = pd.read_parquet(OUTPUT_DIR / "stores.parquet").copy()
@@ -67,6 +72,7 @@ def load_etl_star_schema(run_id: str) -> dict[str, int]:
     customers = customers.drop_duplicates(subset=["customer_id"]).copy()
     products = products.drop_duplicates(subset=["product_id"]).copy()
     stores = stores.drop_duplicates(subset=["store_id"]).copy()
+
 
     customer_dim = customers.copy()
     if "email" in customer_dim.columns:
@@ -109,6 +115,7 @@ def load_etl_star_schema(run_id: str) -> dict[str, int]:
         con.execute("BEGIN TRANSACTION")
         try:
             _create_table(con, "etl_dim_customer", customer_dim)
+            scd2_summary = apply_customer_loyalty_scd2( con, source_table="etl_dim_customer",)
             _create_table(con, "etl_dim_product", products)
             _create_table(con, "etl_dim_store", stores)
             _create_table(con, "etl_fact_orders", fact)
@@ -122,6 +129,9 @@ def load_etl_star_schema(run_id: str) -> dict[str, int]:
         "etl_dim_product": len(products),
         "etl_dim_store": len(stores),
         "etl_fact_orders": len(fact),
+        "dim_customer_scd2_history_rows": scd2_summary["history_rows"],
+        "dim_customer_scd2_current_customers": scd2_summary["current_customers"],
+        "dim_customer_scd2_historical_versions": scd2_summary["historical_versions"],
     }
 
 
@@ -257,7 +267,7 @@ def build_etl_payment_reconciliation(source_dir: Path, run_id: str) -> int:
 
 
 def build_etl_reports() -> dict[str, list[dict[str, Any]]]:
-    """Build the required ETL reporting tables and return loggable summaries."""
+    """Build ETL reports, including daily store-capacity monitoring."""
     with duckdb.connect(str(WAREHOUSE_PATH)) as con:
         con.execute("""
             CREATE OR REPLACE TABLE etl_daily_zone_revenue AS
@@ -274,29 +284,137 @@ def build_etl_reports() -> dict[str, list[dict[str, Any]]]:
             GROUP BY f.order_date, s.zone, f.store_id, s.store_name
             ORDER BY f.order_date, s.zone, f.store_id
         """)
+
         con.execute("""
             CREATE OR REPLACE TABLE etl_category_margin AS
             SELECT
                 p.category,
                 ROUND(SUM(f.net_revenue), 2) AS revenue,
                 ROUND(SUM(f.quantity * p.cost_price), 2) AS cost_of_goods,
-                ROUND(SUM(f.net_revenue - f.quantity * p.cost_price), 2) AS gross_margin
+                ROUND(SUM(f.net_revenue - f.quantity * p.cost_price), 2)
+                    AS gross_margin
             FROM etl_fact_orders f
             JOIN etl_dim_product p USING (product_id)
             WHERE UPPER(f.order_status) = 'DELIVERED'
             GROUP BY p.category
             ORDER BY p.category
         """)
-        daily = con.execute("SELECT * FROM etl_daily_zone_revenue ORDER BY order_date, zone, store_id LIMIT 20").fetchdf()
-        categories = con.execute("SELECT * FROM etl_category_margin ORDER BY category").fetchdf()
-        counts = con.execute("""
-            SELECT 'etl_fact_orders' AS table_name, COUNT(*) AS row_count FROM etl_fact_orders
-            UNION ALL SELECT 'etl_payment_reconciliation', COUNT(*) FROM etl_payment_reconciliation
-            UNION ALL SELECT 'etl_daily_zone_revenue', COUNT(*) FROM etl_daily_zone_revenue
-            UNION ALL SELECT 'etl_category_margin', COUNT(*) FROM etl_category_margin
+
+        # Count all valid orders by store and calendar day.
+        # Exceeding capacity is an operational warning, not a DQ failure.
+        con.execute("""
+            CREATE OR REPLACE TABLE etl_daily_store_capacity AS
+            WITH daily AS (
+                SELECT
+                    f.order_date,
+                    f.store_id,
+                    s.store_name,
+                    TRY_CAST(s.capacity_orders_per_day AS DOUBLE)
+                        AS capacity_orders_per_day,
+                    COUNT(*) AS daily_orders
+                FROM etl_fact_orders f
+                JOIN etl_dim_store s USING (store_id)
+                GROUP BY
+                    f.order_date,
+                    f.store_id,
+                    s.store_name,
+                    s.capacity_orders_per_day
+            )
+            SELECT
+                order_date,
+                store_id,
+                store_name,
+                daily_orders,
+                capacity_orders_per_day,
+                ROUND(
+                    100.0 * daily_orders
+                    / NULLIF(capacity_orders_per_day, 0),
+                    2
+                ) AS capacity_utilization_pct,
+                daily_orders > capacity_orders_per_day AS capacity_breached
+            FROM daily
+            ORDER BY order_date, store_id
+        """)
+
+        daily = con.execute("""
+            SELECT * FROM etl_daily_zone_revenue
+            ORDER BY order_date, zone, store_id LIMIT 20
         """).fetchdf()
+
+        categories = con.execute("""
+            SELECT * FROM etl_category_margin ORDER BY category
+        """).fetchdf()
+
+        capacity = con.execute("""
+            SELECT * FROM etl_daily_store_capacity
+            ORDER BY order_date, store_id LIMIT 20
+        """).fetchdf()
+
+        counts = con.execute("""
+            SELECT 'etl_fact_orders' AS table_name, COUNT(*) AS row_count
+                FROM etl_fact_orders
+            UNION ALL
+            SELECT 'etl_payment_reconciliation', COUNT(*)
+                FROM etl_payment_reconciliation
+            UNION ALL
+            SELECT 'etl_daily_zone_revenue', COUNT(*)
+                FROM etl_daily_zone_revenue
+            UNION ALL
+            SELECT 'etl_category_margin', COUNT(*)
+                FROM etl_category_margin
+            UNION ALL
+            SELECT 'etl_daily_store_capacity', COUNT(*)
+                FROM etl_daily_store_capacity
+        """).fetchdf()
+
     return {
         "table_counts": counts.to_dict(orient="records"),
         "daily_zone_revenue_sample": daily.to_dict(orient="records"),
         "category_margin": categories.to_dict(orient="records"),
+        "store_capacity_sample": capacity.to_dict(orient="records"),
     }
+
+# def build_etl_reports() -> dict[str, list[dict[str, Any]]]:
+#     """Build the required ETL reporting tables and return loggable summaries."""
+#     with duckdb.connect(str(WAREHOUSE_PATH)) as con:
+#         con.execute("""
+#             CREATE OR REPLACE TABLE etl_daily_zone_revenue AS
+#             SELECT
+#                 f.order_date,
+#                 s.zone,
+#                 f.store_id,
+#                 s.store_name,
+#                 COUNT(*) AS delivered_orders,
+#                 ROUND(SUM(f.net_revenue), 2) AS net_revenue
+#             FROM etl_fact_orders f
+#             JOIN etl_dim_store s USING (store_id)
+#             WHERE UPPER(f.order_status) = 'DELIVERED'
+#             GROUP BY f.order_date, s.zone, f.store_id, s.store_name
+#             ORDER BY f.order_date, s.zone, f.store_id
+#         """)
+#         con.execute("""
+#             CREATE OR REPLACE TABLE etl_category_margin AS
+#             SELECT
+#                 p.category,
+#                 ROUND(SUM(f.net_revenue), 2) AS revenue,
+#                 ROUND(SUM(f.quantity * p.cost_price), 2) AS cost_of_goods,
+#                 ROUND(SUM(f.net_revenue - f.quantity * p.cost_price), 2) AS gross_margin
+#             FROM etl_fact_orders f
+#             JOIN etl_dim_product p USING (product_id)
+#             WHERE UPPER(f.order_status) = 'DELIVERED'
+#             GROUP BY p.category
+#             ORDER BY p.category
+#         """)
+#         daily = con.execute("SELECT * FROM etl_daily_zone_revenue ORDER BY order_date, zone, store_id LIMIT 20").fetchdf()
+#         categories = con.execute("SELECT * FROM etl_category_margin ORDER BY category").fetchdf()
+#         counts = con.execute("""
+#             SELECT 'etl_fact_orders' AS table_name, COUNT(*) AS row_count FROM etl_fact_orders
+#             UNION ALL SELECT 'etl_payment_reconciliation', COUNT(*) FROM etl_payment_reconciliation
+#             UNION ALL SELECT 'etl_daily_zone_revenue', COUNT(*) FROM etl_daily_zone_revenue
+#             UNION ALL SELECT 'etl_category_margin', COUNT(*) FROM etl_category_margin
+#         """).fetchdf()
+#     return {
+#         "table_counts": counts.to_dict(orient="records"),
+#         "daily_zone_revenue_sample": daily.to_dict(orient="records"),
+#         "category_margin": categories.to_dict(orient="records"),
+#     }

@@ -27,3 +27,14 @@ include/output/nammamart_elt/
 include/output/etl_extracts/
 include/quarantine/
 include/warehouse_gowtham.duckdb*
+
+# Generated NammaMart pipeline output and local databases
+/include/output/
+
+# Temporary source-code backups
+*.bak
+*.before_audit
+*.before_idempotency_*
+*.before_sql_layers
+*.before_sql_integration
+*.pre_raw_layer_backup*
