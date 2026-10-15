@@ -1,6 +1,7 @@
 
 """DuckDB SQL-based ELT pipeline for NammaMart."""
 
+import logging
 from pathlib import Path
 
 import duckdb
@@ -23,7 +24,7 @@ SOURCE_FILES = {
 }
 
 
-def run_elt() -> dict:
+def run_elt(run_id: str | None = None) -> dict:
     """Load raw CSVs into DuckDB, transform using SQL, and export results."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -31,15 +32,224 @@ def run_elt() -> dict:
     results = {}
 
     try:
-        # EXTRACT + LOAD: retain raw source data in DuckDB.
-        for table, filename in SOURCE_FILES.items():
+        # EXTRACT + LOAD: append-only raw history with file-hash tracking.
+        import csv
+        import hashlib
+        import uuid
+
+        run_id = run_id or str(uuid.uuid4())
+
+        source_to_raw = {
+            "customers": "customers",
+            "products": "products",
+            "stores": "stores",
+            "orders": "orders",
+            "orders_increment": "orders",
+            "payments": "payments",
+        }
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS elt_ingestion_manifest (
+                source_file VARCHAR PRIMARY KEY,
+                content_hash VARCHAR NOT NULL,
+                last_loaded_at TIMESTAMP NOT NULL,
+                last_run_id VARCHAR NOT NULL
+            )
+        """)
+
+        # Create destination raw tables and add metadata to legacy tables.
+        for source_name, filename in SOURCE_FILES.items():
             source_path = SOURCE_DIR / filename
-            if not source_path.exists():
+            if not source_path.is_file():
                 raise FileNotFoundError(source_path)
+
+            raw_table = f"raw_{source_to_raw[source_name]}"
+            con.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {raw_table} AS
+                SELECT *,
+                       CAST(NULL AS TIMESTAMP) AS _loaded_at,
+                       CAST(NULL AS VARCHAR) AS _source_file,
+                       CAST(NULL AS VARCHAR) AS _run_id
+                FROM read_csv_auto(?, all_varchar = true)
+                WHERE FALSE
+                """,
+                [str(source_path)],
+            )
+            for column, sql_type in (
+                ("_loaded_at", "TIMESTAMP"),
+                ("_source_file", "VARCHAR"),
+                ("_run_id", "VARCHAR"),
+            ):
+                con.execute(
+                    f"ALTER TABLE {raw_table} "
+                    f"ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+                )
+
+            # Backfill legacy rows without overwriting existing metadata.
+            legacy_file = (
+                "orders.csv" if source_name == "orders" else filename
+            )
+            con.execute(
+                f"""
+                UPDATE {raw_table}
+                SET _loaded_at = COALESCE(_loaded_at, CURRENT_TIMESTAMP),
+                    _source_file = COALESCE(_source_file, ?),
+                    _run_id = COALESCE(_run_id, 'legacy_migration')
+                WHERE _loaded_at IS NULL
+                   OR _source_file IS NULL
+                   OR _run_id IS NULL
+                """,
+                [legacy_file],
+            )
+
+        # Migrate the old separate increment table once, if it exists.
+        increment_file = SOURCE_FILES["orders_increment"]
+        legacy_increment_exists = con.execute("""
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_name = 'raw_orders_increment'
+        """).fetchone()[0] > 0
+
+        migration_key = "__legacy_raw_orders_increment__"
+        migration_done = con.execute(
+            "SELECT COUNT(*) FROM elt_ingestion_manifest "
+            "WHERE source_file = ?",
+            [migration_key],
+        ).fetchone()[0] > 0
+
+        if legacy_increment_exists and not migration_done:
+            already_migrated = con.execute("""
+                SELECT COUNT(*)
+                FROM raw_orders
+                WHERE _source_file = ?
+            """, [increment_file]).fetchone()[0]
+
+            if already_migrated == 0:
+                columns = [
+                    row[0] for row in con.execute(
+                        "SELECT * FROM raw_orders_increment LIMIT 0"
+                    ).description
+                ]
+                # Exclude metadata if an older experimental table has them.
+                columns = [
+                    name for name in columns
+                    if name not in {"_loaded_at", "_source_file", "_run_id"}
+                ]
+                quoted = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+                con.execute(
+                    f"""
+                    INSERT INTO raw_orders
+                        ({quoted}, _loaded_at, _source_file, _run_id)
+                    SELECT {quoted}, CURRENT_TIMESTAMP, ?, 'legacy_migration'
+                    FROM raw_orders_increment
+                    """,
+                    [increment_file],
+                )
+
+            con.execute(
+                "DELETE FROM elt_ingestion_manifest WHERE source_file = ?",
+                [migration_key],
+            )
+            con.execute(
+                """
+                INSERT INTO elt_ingestion_manifest
+                    (source_file, content_hash, last_loaded_at, last_run_id)
+                VALUES (?, 'migrated-v1', CURRENT_TIMESTAMP, ?)
+                """,
+                [migration_key, run_id],
+            )
+
+        # Hash each source. Bootstrap the manifest from matching legacy rows
+        # where possible; otherwise append the snapshot once.
+        for source_name, filename in SOURCE_FILES.items():
+            source_path = SOURCE_DIR / filename
+            raw_table = f"raw_{source_to_raw[source_name]}"
+            digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+            manifest_hash = con.execute(
+                "SELECT content_hash FROM elt_ingestion_manifest "
+                "WHERE source_file = ?",
+                [filename],
+            ).fetchone()
+
+            if manifest_hash and manifest_hash[0] == digest:
+                logging.info("Raw ingestion skipped; unchanged file: %s", filename)
+                continue
+
+            if manifest_hash is None:
+                csv_rows = sum(
+                    1 for _ in csv.DictReader(
+                        source_path.open(
+                            newline="", encoding="utf-8-sig"
+                        )
+                    )
+                )
+                legacy_rows = con.execute(
+                    f"""
+                    SELECT COUNT(*) FROM {raw_table}
+                    WHERE _source_file = ? AND _run_id = 'legacy_migration'
+                    """,
+                    [filename],
+                ).fetchone()[0]
+
+                if csv_rows == legacy_rows:
+                    con.execute(
+                        """
+                        INSERT INTO elt_ingestion_manifest
+                            (source_file, content_hash, last_loaded_at, last_run_id)
+                        VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                        """,
+                        [filename, digest, run_id],
+                    )
+                    logging.info(
+                        "Manifest bootstrapped from legacy rows: %s (%s rows)",
+                        filename, csv_rows,
+                    )
+                    continue
+
+            columns = [
+                row[0] for row in con.execute(
+                    "DESCRIBE SELECT * FROM read_csv_auto(?, all_varchar = true)",
+                    [str(source_path)],
+                ).fetchall()
+            ]
+            quoted = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+            con.execute(
+                f"""
+                INSERT INTO {raw_table}
+                    ({quoted}, _loaded_at, _source_file, _run_id)
+                SELECT {quoted}, CURRENT_TIMESTAMP, ?, ?
+                FROM read_csv_auto(?, all_varchar = true)
+                """,
+                [filename, run_id, str(source_path)],
+            )
+            con.execute(
+                "DELETE FROM elt_ingestion_manifest WHERE source_file = ?",
+                [filename],
+            )
+            con.execute(
+                """
+                INSERT INTO elt_ingestion_manifest
+                    (source_file, content_hash, last_loaded_at, last_run_id)
+                VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                """,
+                [filename, digest, run_id],
+            )
+            logging.info("Appended raw snapshot: %s", filename)
+
+        # Always transform the current source snapshot, even if unchanged
+        # and therefore not appended to the persistent raw tables.
+        for source_name, filename in SOURCE_FILES.items():
+            source_path = SOURCE_DIR / filename
+            if source_name == "orders_increment":
+                temp_table = "raw_orders_increment_current"
+            else:
+                temp_table = f"raw_{source_to_raw[source_name]}_current"
 
             con.execute(
                 f"""
-                CREATE OR REPLACE TABLE raw_{table} AS
+                CREATE OR REPLACE TEMP TABLE {temp_table} AS
                 SELECT *
                 FROM read_csv_auto(?, all_varchar = true)
                 """,
@@ -58,7 +268,7 @@ def run_elt() -> dict:
                 SELECT {key}
                 FROM (
                     SELECT DISTINCT *
-                    FROM raw_{table}
+                    FROM raw_{table}_current
                 ) d
                 GROUP BY {key}
                 HAVING COUNT(*) > 1
@@ -70,7 +280,7 @@ def run_elt() -> dict:
                 f"""
                 CREATE OR REPLACE TABLE {table}_distinct AS
                 SELECT DISTINCT *
-                FROM raw_{table}
+                FROM raw_{table}_current
                 """
             )
 
@@ -144,11 +354,11 @@ def run_elt() -> dict:
         # for existing order IDs and inserts new order IDs.
         con.execute("""
             CREATE OR REPLACE TABLE orders_base_distinct AS
-            SELECT DISTINCT * FROM raw_orders
+            SELECT DISTINCT * FROM raw_orders_current
         """)
         con.execute("""
             CREATE OR REPLACE TABLE orders_increment_distinct AS
-            SELECT DISTINCT * FROM raw_orders_increment
+            SELECT DISTINCT * FROM raw_orders_increment_current
         """)
         con.execute("""
             CREATE OR REPLACE TABLE orders_base_conflict_keys AS
@@ -352,7 +562,7 @@ def run_elt() -> dict:
         # Payments referencing orders excluded from curation are quarantined.
         con.execute("""
             CREATE OR REPLACE TABLE payments_distinct AS
-            SELECT DISTINCT * FROM raw_payments
+            SELECT DISTINCT * FROM raw_payments_current
         """)
         con.execute("""
             CREATE OR REPLACE TABLE payments_quarantine AS
@@ -371,69 +581,117 @@ def run_elt() -> dict:
             ) = 1
         """)
 
-        # Export curated and quarantine tables to CSV and Parquet.
+        # Execute the assignment SQL layers on the same connection so
+        # current-run temporary source tables remain available.
+        from include.nammamart.sql_runner import execute_sql_files
+
+        execute_sql_files(
+            con,
+            [
+                "01_staging_dimensions.sql",
+                "02_dimension_quality.sql",
+                "03_staging_orders.sql",
+                "04_staging_payments.sql",
+                "05_mart_daily_store_kpis.sql",
+                "06_mart_category_margin.sql",
+                "07_mart_delivery_sla.sql",
+                "08_mart_top_customers.sql",
+            ],
+        )
+
+        # Export the final SQL staging and quarantine tables.
         datasets = [
-            "customers", "products", "stores", "orders", "payments"
+            ("customers", "stg_customers", "customers_quarantine", "customer_id"),
+            ("products", "stg_products", "products_quarantine", "product_id"),
+            ("stores", "stg_stores", "stores_quarantine", "store_id"),
+            ("orders", "stg_orders", "orders_quarantine", "order_id"),
+            ("payments", "stg_payments", "payments_quarantine", "payment_id"),
         ]
-        for dataset in datasets:
-            for suffix in ["curated", "quarantine"]:
-                table = f"{dataset}_{suffix}"
+
+        report_rows = []
+
+        for dataset, curated_table, quarantine_table, key in datasets:
+            dataset_counts = {}
+
+            for suffix, table in [
+                ("curated", curated_table),
+                ("quarantine", quarantine_table),
+            ]:
                 df = con.execute(f"SELECT * FROM {table}").df()
+
+                # Do not export raw customer contact details from quarantine.
+                if dataset == "customers":
+                    if "email" in df.columns:
+                        df["email"] = df["email"].map(
+                            lambda value: (
+                                str(value)[:2] + "***@***"
+                                if pd.notna(value) and "@" in str(value)
+                                else "***"
+                                if pd.notna(value) and str(value).strip()
+                                else value
+                            )
+                        )
+                    if "phone" in df.columns:
+                        df["phone"] = df["phone"].map(
+                            lambda value: (
+                                "***" + str(value)[-2:]
+                                if pd.notna(value) and str(value).strip()
+                                else value
+                            )
+                        )
+
                 csv_path = OUTPUT_DIR / (
-                    f"{dataset}.csv" if suffix == "curated"
+                    f"{dataset}.csv"
+                    if suffix == "curated"
                     else f"{dataset}_quarantine.csv"
                 )
                 parquet_path = OUTPUT_DIR / (
-                    f"{dataset}.parquet" if suffix == "curated"
+                    f"{dataset}.parquet"
+                    if suffix == "curated"
                     else f"{dataset}_quarantine.parquet"
                 )
+
                 df.to_csv(csv_path, index=False)
                 df.to_parquet(parquet_path, index=False)
-                results[table] = {
+
+                dataset_counts[suffix] = len(df)
+                results[f"{dataset}_{suffix}"] = {
                     "rows": len(df),
                     "csv": str(csv_path),
                     "parquet": str(parquet_path),
                 }
 
-        # Quality summary from final table contents.
-        report_rows = []
-        for dataset, key in [
-            ("customers", "customer_id"),
-            ("products", "product_id"),
-            ("stores", "store_id"),
-            ("orders", "order_id"),
-            ("payments", "payment_id"),
-        ]:
             curated_count = con.execute(
-                f"SELECT COUNT(*) FROM {dataset}_curated"
+                f"SELECT COUNT(*) FROM {curated_table}"
             ).fetchone()[0]
-            quarantine_count = con.execute(
-                f"SELECT COUNT(*) FROM {dataset}_quarantine"
-            ).fetchone()[0]
-            key_stats = con.execute(
+            duplicate_keys, missing_keys = con.execute(
                 f"""
                 SELECT
                     COUNT(*) - COUNT(DISTINCT {key}),
                     COUNT(*) FILTER (
                         WHERE {key} IS NULL OR TRIM({key}) = ''
                     )
-                FROM {dataset}_curated
+                FROM {curated_table}
                 """
             ).fetchone()
+
             report_rows.append({
                 "dataset": dataset,
                 "curated_rows": curated_count,
-                "quarantined_rows": quarantine_count,
-                "total_processed_rows": curated_count + quarantine_count,
+                "quarantined_rows": dataset_counts["quarantine"],
+                "total_processed_rows": (
+                    curated_count + dataset_counts["quarantine"]
+                ),
                 "business_key": key,
-                "business_key_unique": key_stats[0] == 0,
-                "missing_business_keys": key_stats[1],
+                "business_key_unique": duplicate_keys == 0,
+                "missing_business_keys": missing_keys,
             })
 
         report = pd.DataFrame(report_rows)
         report.to_csv(OUTPUT_DIR / "elt_quality_report.csv", index=False)
         report.to_parquet(OUTPUT_DIR / "elt_quality_report.parquet", index=False)
         results["quality_report"] = report.to_dict(orient="records")
+        results["run_id"] = run_id
         return results
     finally:
         con.close()

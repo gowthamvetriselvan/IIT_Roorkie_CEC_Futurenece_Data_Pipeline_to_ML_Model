@@ -40,11 +40,15 @@ def write_dataset(df: pd.DataFrame, dataset_name: str) -> dict[str, str]:
 def _split_conflicting_keys(
     df: pd.DataFrame, key: str
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Quarantine all rows for business keys with conflicting records."""
-    valid = df[key].notna() & df[key].str.strip().ne("")
-    keyed = df.loc[valid]
+    """Quarantine missing keys and conflicting business-key records."""
 
-    duplicate_rows = keyed.loc[keyed.duplicated(subset=[key], keep=False)]
+    key_values = df[key].astype("string").str.strip()
+    missing_key = key_values.isna() | key_values.eq("")
+    keyed = df.loc[~missing_key]
+
+    duplicate_rows = keyed.loc[
+        keyed.duplicated(subset=[key], keep=False)
+    ]
     conflicting_keys = []
 
     for value, group in duplicate_rows.groupby(key, sort=False):
@@ -52,44 +56,173 @@ def _split_conflicting_keys(
         if len(group.drop_duplicates()) > 1:
             conflicting_keys.append(value)
 
-    conflicts = df.loc[df[key].isin(conflicting_keys)].copy()
-    clean = df.loc[~df[key].isin(conflicting_keys)].copy()
+    conflicts = df.loc[key_values.isin(conflicting_keys)].copy()
+    conflicts["quarantine_reason"] = "conflicting_business_key"
 
-    # Missing business keys cannot safely identify a unique entity.
-    missing_key = df[key].isna() | df[key].str.strip().eq("")
-    conflicts = pd.concat([conflicts, df.loc[missing_key]], ignore_index=True)
-    clean = clean.loc[~missing_key].copy()
+    missing = df.loc[missing_key].copy()
+    missing["quarantine_reason"] = "missing_business_key"
 
-    return clean, conflicts
+    clean = df.loc[
+        ~missing_key & ~key_values.isin(conflicting_keys)
+    ].copy()
 
-
-def transform_customers() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Clean customers and quarantine conflicting or missing IDs."""
-    df = read_source_csv("customers.csv")
-
-    # Remove repeated identical records first.
-    df = df.drop_duplicates().copy()
-
-    clean, quarantine = _split_conflicting_keys(df, "customer_id")
-
-    clean["city"] = clean["city"].fillna("UNKNOWN")
-    clean["city"] = clean["city"].str.strip().replace("", "UNKNOWN")
+    quarantine = pd.concat(
+        [conflicts, missing],
+        ignore_index=True,
+    )
 
     return clean, quarantine
 
 
+
+def transform_customers() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Clean customers and quarantine critical timestamp/key failures."""
+    df = read_source_csv("customers.csv").drop_duplicates().copy()
+
+    clean, key_quarantine = _split_conflicting_keys(df, "customer_id")
+
+    signup_ts = pd.to_datetime(clean["signup_date"], errors="coerce", format="mixed")
+    now = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
+
+    if signup_ts.dt.tz is not None:
+        signup_ts = signup_ts.dt.tz_localize(None)
+
+    invalid_signup = signup_ts.isna()
+    future_signup = signup_ts.notna() & (signup_ts > now)
+
+    timestamp_quarantine = clean.loc[invalid_signup | future_signup].copy()
+    timestamp_quarantine["quarantine_reason"] = "invalid_signup_date"
+    timestamp_quarantine.loc[future_signup.loc[timestamp_quarantine.index], "quarantine_reason"] = (
+        "future_customer_signup_date"
+    )
+
+    clean = clean.loc[~(invalid_signup | future_signup)].copy()
+
+    clean["city"] = clean["city"].fillna("UNKNOWN")
+    clean["city"] = clean["city"].astype("string").str.strip().replace("", "UNKNOWN")
+
+    quarantine = pd.concat(
+        [key_quarantine, timestamp_quarantine],
+        ignore_index=True,
+        sort=False,
+    )
+
+    return clean, quarantine
+
+
+
 def transform_products() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Clean products and quarantine conflicting or missing IDs."""
-    df = read_source_csv("products.csv")
+    """Clean products and quarantine key conflicts and invalid pricing."""
+    from include.nammamart.quality import product_pricing_issues
 
-    df = df.drop_duplicates().copy()
+    df = read_source_csv("products.csv").drop_duplicates().copy()
 
-    clean, quarantine = _split_conflicting_keys(df, "product_id")
+    clean, key_quarantine = _split_conflicting_keys(df, "product_id")
 
     clean["category"] = clean["category"].fillna("UNKNOWN")
     clean["category"] = clean["category"].str.strip().replace("", "UNKNOWN")
 
+    pricing_issues = product_pricing_issues(clean)
+
+    if pricing_issues.empty:
+        return clean, key_quarantine
+
+    # Group issue descriptions by product so one product can retain
+    # multiple quarantine reasons.
+    reasons = (
+        pricing_issues.groupby("row_key")["problem"]
+        .agg(lambda values: "; ".join(dict.fromkeys(values)))
+    )
+
+    invalid_mask = clean["product_id"].isin(reasons.index)
+    invalid_products = clean.loc[invalid_mask].copy()
+
+    invalid_products["quarantine_reason"] = (
+        invalid_products["product_id"]
+        .map(reasons)
+        .map(lambda value: value.replace(
+            "MRP must be a valid number greater than zero",
+            "invalid_mrp",
+        ).replace(
+            "Cost price must not exceed MRP",
+            "cost_price_exceeds_mrp",
+        ))
+    )
+
+    clean = clean.loc[~invalid_mask].copy()
+
+    quarantine = pd.concat(
+        [key_quarantine, invalid_products],
+        ignore_index=True,
+        sort=False,
+    )
+
     return clean, quarantine
+
+
+
+def normalize_order_values(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Normalize approved order aliases and return unsupported records separately."""
+    clean = df.copy()
+
+    # Preserve source values for auditability.
+    clean["source_order_status"] = clean["order_status"]
+    clean["source_payment_mode"] = clean["payment_mode"]
+
+    status_aliases = {
+        "delivered": "DELIVERED",
+        "cancelled": "CANCELLED",
+        "returned": "RETURNED",
+    }
+    mode_aliases = {
+        "upi": "UPI",
+        "card": "Card",
+        "cash on delivery": "Cash on Delivery",
+        "cod": "Cash on Delivery",
+        "wallet": "Wallet",
+    }
+
+    status_text = clean["order_status"].astype("string").str.strip()
+    mode_text = clean["payment_mode"].astype("string").str.strip()
+
+    clean["order_status"] = status_text.map(
+        lambda value: (
+            status_aliases.get(value.lower(), value)
+            if pd.notna(value) else value
+        )
+    )
+    clean["payment_mode"] = mode_text.map(
+        lambda value: (
+            mode_aliases.get(value.lower(), value)
+            if pd.notna(value) else value
+        )
+    )
+
+    valid_statuses = {"DELIVERED", "CANCELLED", "RETURNED"}
+    valid_modes = {"UPI", "Card", "Cash on Delivery", "Wallet"}
+
+    invalid_mask = (
+        ~clean["order_status"].isin(valid_statuses)
+        | ~clean["payment_mode"].isin(valid_modes)
+    )
+
+    invalid = clean.loc[invalid_mask].copy()
+    invalid_reasons = []
+
+    for _, row in invalid.iterrows():
+        reasons = []
+        if row["order_status"] not in valid_statuses:
+            reasons.append("invalid_order_status")
+        if row["payment_mode"] not in valid_modes:
+            reasons.append("invalid_payment_mode")
+        invalid_reasons.append("; ".join(reasons))
+
+    invalid["quarantine_reason"] = invalid_reasons
+    clean = clean.loc[~invalid_mask].copy()
+
+    return clean, invalid
 
 
 def transform_orders() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -157,7 +290,16 @@ def transform_orders() -> tuple[pd.DataFrame, pd.DataFrame]:
             f"{combined.loc[duplicate_ids, 'order_id'].tolist()}"
         )
 
-    return combined, quarantine
+    # Normalize the final upserted order values.
+    # Invalid statuses or payment modes are quarantined, not curated.
+    normalized, invalid_values = normalize_order_values(combined)
+
+    quarantine = pd.concat(
+        [quarantine, invalid_values],
+        ignore_index=True,
+    )
+
+    return normalized, quarantine
 
 
 #def transform_payments(
@@ -197,10 +339,10 @@ def transform_orders() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def transform_payments(
     valid_order_ids: set[str],
+    order_amounts: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Deduplicate payments and quarantine invalid references with reasons."""
+    """Deduplicate payments and quarantine invalid references or amounts."""
     df = read_source_csv("payments.csv").drop_duplicates().copy()
-
     quarantine_parts = []
 
     # Identify missing payment IDs.
@@ -227,12 +369,12 @@ def transform_payments(
         conflicts["quarantine_reason"] = "conflicting_payment_id"
         quarantine_parts.append(conflicts)
 
-    # Continue with records having usable, non-conflicting payment IDs.
+    # Continue with usable, non-conflicting payment IDs.
     df = df.loc[
         ~missing_id & ~payment_id.isin(conflicting_ids)
     ].copy()
 
-    # Validate order references separately from payment IDs.
+    # Validate order references.
     order_ref = df["order_id"].astype("string").str.strip()
     missing_order = order_ref.isna() | order_ref.eq("")
 
@@ -254,26 +396,92 @@ def transform_payments(
         orphan_rows["quarantine_reason"] = "orphan_order_id"
         quarantine_parts.append(orphan_rows)
 
-    # Keep only payments with valid references to curated orders.
     clean = df.loc[~missing_order & ~orphan_order].copy()
+
+    # Reconcile successful payments when order amounts are supplied.
+    if order_amounts is not None and not clean.empty:
+        amounts = order_amounts[["order_id", "order_amount"]].copy()
+        amounts["order_id"] = amounts["order_id"].astype("string").str.strip()
+        amounts["order_amount"] = pd.to_numeric(
+            amounts["order_amount"], errors="coerce"
+        ).round(2)
+
+        clean["amount_paid"] = pd.to_numeric(
+            clean["amount_paid"], errors="coerce"
+        ).round(2)
+
+        clean = clean.merge(
+            amounts,
+            on="order_id",
+            how="left",
+            validate="many_to_one",
+        )
+
+        successful = (
+            clean["payment_status"].astype("string").str.strip().str.upper()
+            .eq("SUCCESS")
+        )
+
+        mismatch = successful & (
+            clean["order_amount"].isna()
+            | clean["amount_paid"].isna()
+            | clean["amount_paid"].ne(clean["order_amount"])
+        )
+
+        amount_quarantine = clean.loc[mismatch].copy()
+        if not amount_quarantine.empty:
+            amount_quarantine = amount_quarantine.drop(
+                columns=["order_amount"]
+            )
+            amount_quarantine["amount_paid"] = (
+                amount_quarantine["amount_paid"].astype("string")
+            )
+            amount_quarantine["quarantine_reason"] = "payment_amount_mismatch"
+            quarantine_parts.append(amount_quarantine)
+
+        clean = clean.loc[~mismatch].drop(columns=["order_amount"])
 
     quarantine = (
         pd.concat(quarantine_parts, ignore_index=True)
         if quarantine_parts
-        else pd.DataFrame(
-            columns=[*df.columns, "quarantine_reason"]
-        )
+        else pd.DataFrame(columns=[*df.columns, "quarantine_reason"])
     )
+        # Keep payment amount types consistent for Parquet serialization.
+    if "amount_paid" in quarantine.columns:
+        quarantine["amount_paid"] = (
+            quarantine["amount_paid"].astype("string")
+        )
 
     return clean, quarantine
 
+
 def transform_stores() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Clean stores and normalize missing zones."""
+    """Clean stores and quarantine conflicting keys or invalid capacity."""
     df = read_source_csv("stores.csv").drop_duplicates().copy()
 
     clean, quarantine = _split_conflicting_keys(df, "store_id")
+
+    # Match ELT: missing, invalid, or non-positive capacity is Critical.
+    capacity = pd.to_numeric(
+        clean["capacity_orders_per_day"], errors="coerce"
+    )
+    invalid_capacity = capacity.isna() | capacity.le(0)
+
+    capacity_quarantine = clean.loc[invalid_capacity].copy()
+    if not capacity_quarantine.empty:
+        capacity_quarantine["quarantine_reason"] = (
+            "invalid_capacity_orders_per_day"
+        )
+
+    clean = clean.loc[~invalid_capacity].copy()
+
     clean["zone"] = clean["zone"].fillna("UNKNOWN")
     clean["zone"] = clean["zone"].str.strip().replace("", "UNKNOWN")
+
+    quarantine = pd.concat(
+        [quarantine, capacity_quarantine],
+        ignore_index=True,
+    )
 
     return clean, quarantine
 
@@ -322,7 +530,24 @@ def validate_orders(
     reasons.loc[invalid_timestamp] = reasons.loc[invalid_timestamp].apply(
         lambda current: f"{current}; invalid_order_ts".strip("; ")
     )
+        # Quarantine orders with future timestamps.
+    now = pd.Timestamp.now(tz="UTC")
 
+    comparable_timestamps = timestamp_values.copy()
+
+    if comparable_timestamps.dt.tz is None:
+        comparable_timestamps = comparable_timestamps.dt.tz_localize("UTC")
+    else:
+        comparable_timestamps = comparable_timestamps.dt.tz_convert("UTC")
+
+    future_timestamp = (
+        comparable_timestamps.notna()
+        & (comparable_timestamps > now)
+    )
+
+    reasons.loc[future_timestamp] = reasons.loc[future_timestamp].apply(
+        lambda current: f"{current}; future_order_ts".strip("; ")
+    )
     # Validate foreign-key references.
     references = [
         ("customer_id", customers, "customer_id"),
@@ -340,6 +565,82 @@ def validate_orders(
             lambda current: f"{current}; orphan_{child_key}".strip("; ")
         )
 
+    # Validate critical order accuracy rules.
+    from include.nammamart.quality import order_accuracy_issues
+
+    accuracy_issues = order_accuracy_issues(df)
+
+    if not accuracy_issues.empty:
+        reason_mapping = {
+            "Quantity must be greater than zero": "invalid_quantity",
+            "Discount must be between 0 and 100": "invalid_discount_pct",
+            "Order amount does not match the required formula":
+                "order_amount_mismatch",
+        }
+
+        accuracy_issues = accuracy_issues.copy()
+        accuracy_issues["row_key"] = (
+            accuracy_issues["row_key"].astype("string")
+        )
+        accuracy_issues["reason"] = accuracy_issues["problem"].map(
+            reason_mapping
+        )
+
+        accuracy_reasons = (
+            accuracy_issues.groupby("row_key")["reason"]
+            .agg(lambda values: "; ".join(dict.fromkeys(values)))
+        )
+
+        order_keys = df["order_id"].astype("string")
+        mapped_reasons = order_keys.map(accuracy_reasons)
+        has_accuracy_issue = mapped_reasons.notna()
+
+        reasons.loc[has_accuracy_issue] = [
+            f"{current}; {accuracy_reason}".strip("; ")
+            for current, accuracy_reason in zip(
+                reasons.loc[has_accuracy_issue],
+                mapped_reasons.loc[has_accuracy_issue],
+            )
+        ]
+        # Validate critical order delivery-time rules.
+    from include.nammamart.quality import order_delivery_issues
+
+    delivery_issues = order_delivery_issues(df)
+
+    if not delivery_issues.empty:
+        reason_mapping = {
+            "Delivered order must have a valid delivery time":
+                "missing_delivery_minutes",
+            "Delivery time must be less than 120 minutes":
+                "delivery_time_over_120",
+            "Delivery time must be greater than zero":
+                "invalid_delivery_minutes",
+        }
+
+        delivery_issues = delivery_issues.copy()
+        delivery_issues["row_key"] = (
+            delivery_issues["row_key"].astype("string")
+        )
+        delivery_issues["reason"] = delivery_issues["problem"].map(
+            reason_mapping
+        )
+
+        delivery_reasons = (
+            delivery_issues.groupby("row_key")["reason"]
+            .agg(lambda values: "; ".join(dict.fromkeys(values)))
+        )
+
+        order_keys = df["order_id"].astype("string")
+        mapped_reasons = order_keys.map(delivery_reasons)
+        has_delivery_issue = mapped_reasons.notna()
+
+        reasons.loc[has_delivery_issue] = [
+            f"{current}; {delivery_reason}".strip("; ")
+            for current, delivery_reason in zip(
+                reasons.loc[has_delivery_issue],
+                mapped_reasons.loc[has_delivery_issue],
+            )
+        ]
     quarantine_mask = reasons.ne("")
     quarantined = df.loc[quarantine_mask].copy()
     quarantined["quarantine_reason"] = reasons.loc[quarantine_mask]
@@ -347,7 +648,7 @@ def validate_orders(
     curated = df.loc[~quarantine_mask].copy()
     return curated, quarantined
 
-def run_etl() -> dict[str, dict[str, str]]:
+def run_etl(run_id: str | None = None) -> dict[str, dict[str, str]]:
     """Run all transformations and persist curated and quarantine outputs."""
     customers, customers_q = transform_customers()
     products, products_q = transform_products()
@@ -360,7 +661,8 @@ def run_etl() -> dict[str, dict[str, str]]:
 
     # Payments must reference orders that survive validation.
     payments, payments_q = transform_payments(
-        set(orders["order_id"].astype(str))
+    set(orders["order_id"].astype(str)),
+    orders[["order_id", "order_amount"]],
     )
 
     outputs = {
@@ -379,7 +681,314 @@ def run_etl() -> dict[str, dict[str, str]]:
         "payments_quarantine": write_dataset(payments_q, "payments_quarantine"),
     }
 
+    if run_id is None:
+        from include.nammamart.dq_results import new_run_id
+        run_id = new_run_id()
+
+    build_dq_results(run_id=run_id)
     return outputs
+
+
+def build_dq_results(run_id: str | None = None) -> pd.DataFrame:
+    """Write standardized run-level data-quality results for ETL."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from include.nammamart.dq_results import (
+        make_dq_result,
+        new_run_id,
+        write_dq_results,
+    )
+    from include.nammamart.quality import (
+        customer_validity_issues,
+        duplicate_key_rows,
+        missing_key_rows,
+        order_accuracy_issues,
+        orphan_rows,
+        payment_reconciliation_issues,
+        product_pricing_issues,
+        order_delivery_issues,
+        timestamp_parsing_issues,
+    )
+
+    datasets = {
+        name: pd.read_parquet(OUTPUT_DIR / f"{name}.parquet")
+        for name in ["customers", "products", "stores", "orders", "payments"]
+    }
+    keys = {
+        "customers": "customer_id",
+        "products": "product_id",
+        "stores": "store_id",
+        "orders": "order_id",
+        "payments": "payment_id",
+    }
+
+    run_id = run_id or new_run_id()
+    checked_at = datetime.now(ZoneInfo("Asia/Kolkata"))
+    results = []
+
+    def record(check_name, dimension, severity, checked, failed):
+        results.append(
+            make_dq_result(
+                run_id=run_id,
+                dag_id="nammamart_etl_pipeline",
+                check_name=check_name,
+                dimension=dimension,
+                severity=severity,
+                rows_checked=int(checked),
+                rows_failed=int(failed),
+                checked_at=checked_at,
+            )
+        )
+
+    # Business-key completeness and uniqueness.
+    for name, df in datasets.items():
+        key = keys[name]
+        record(
+            f"{name}_business_key_completeness",
+            "Completeness", "Critical", len(df),
+            len(missing_key_rows(df, key)),
+        )
+        record(
+            f"{name}_business_key_uniqueness",
+            "Uniqueness", "Critical", len(df),
+            len(duplicate_key_rows(df, key)),
+        )
+
+    # Customer contact validity and loyalty-tier consistency.
+    customers = datasets["customers"]
+    customer_issues = customer_validity_issues(customers)
+
+    # Completeness is distinct from email format validity.
+    email_values = customers["email"].astype("string").str.strip()
+    missing_emails = email_values.isna() | email_values.eq("")
+    record(
+        "customer_email_completeness",
+        "Completeness",
+        "Warning",
+        len(customers),
+        int(missing_emails.sum()),
+    )
+
+    customer_checks = [
+        ("email", "customer_email_format", "Validity"),
+        ("phone", "customer_phone_format", "Validity"),
+        ("pincode", "customer_pincode_format", "Validity"),
+        ("loyalty_tier", "customer_loyalty_tier_casing", "Consistency"),
+    ]
+
+    for column, check_name, dimension in customer_checks:
+        failed = customer_issues.loc[
+            customer_issues["column"].eq(column), "row_key"
+        ].nunique()
+
+        record(
+            check_name,
+            dimension,
+            "Warning",
+            len(customers),
+            failed,
+        )
+        # Timestamp parsing validity.
+    customers = datasets["customers"]
+    orders = datasets["orders"]
+    now = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
+    order_timestamp_issues = timestamp_parsing_issues(
+        orders, "order_ts", "order_id", "Critical"
+    )
+    record(
+        "order_timestamp_parsing",
+        "Validity",
+        "Critical",
+        len(orders),
+        order_timestamp_issues["row_key"].nunique(),
+    )
+
+    signup_timestamp_issues = timestamp_parsing_issues(
+        customers, "signup_date", "customer_id", "Warning"
+    )
+    # record(
+    #     "customer_signup_date_parsing",
+    #     "Validity",
+    #     "Warning",
+    #     len(customers),
+    #     signup_timestamp_issues["row_key"].nunique(),
+    # )
+    signup_ts = pd.to_datetime(
+    customers["signup_date"],
+    errors="coerce",
+    format="mixed",
+)
+    if signup_ts.dt.tz is not None:
+     signup_ts = signup_ts.dt.tz_localize(None)
+    record(
+        "future_customer_signup_date",
+        "Timeliness",
+        "Critical",
+        len(customers),
+        int((signup_ts > now).sum()),
+        )
+    # Delivery-time completeness and accuracy.
+    delivery_issues = order_delivery_issues(orders)
+
+    delivery_checks = [
+        (
+            "delivered_order_delivery_time_completeness",
+            "Completeness",
+            "Delivered order must have a valid delivery time",
+        ),
+        (
+            "delivery_time_under_120_minutes",
+            "Accuracy",
+            "Delivery time must be less than 120 minutes",
+        ),
+        (
+            "delivery_time_greater_than_zero",
+            "Accuracy",
+            "Delivery time must be greater than zero",
+        ),
+    ]
+
+    for check_name, dimension, problem in delivery_checks:
+        failed = delivery_issues.loc[
+            delivery_issues["problem"].eq(problem), "row_key"
+        ].nunique()
+        record(
+            check_name,
+            dimension,
+            "Critical",
+            len(orders),
+            failed,
+        )
+    orders = datasets["orders"]
+
+    # Order foreign-key consistency against curated dimensions.
+    foreign_key_checks = [
+        ("customer_id", "customers", "customer_id", "orders_customer_reference"),
+        ("product_id", "products", "product_id", "orders_product_reference"),
+        ("store_id", "stores", "store_id", "orders_store_reference"),
+    ]
+
+    for child_key, parent_name, parent_key, check_name in foreign_key_checks:
+        missing = missing_key_rows(orders, child_key)
+        orphans = orphan_rows(
+            orders, child_key, datasets[parent_name], parent_key
+        )
+        failed_ids = set(missing["order_id"].dropna()) | set(
+            orphans["order_id"].dropna()
+        )
+        record(
+            check_name,
+            "Consistency",
+            "Critical",
+            len(orders),
+            len(failed_ids),
+        )
+
+    valid_statuses = {"DELIVERED", "CANCELLED", "RETURNED"}
+    valid_modes = {"UPI", "Card", "Cash on Delivery", "Wallet"}
+    status = orders["order_status"].astype("string").str.strip()
+    mode = orders["payment_mode"].astype("string").str.strip()
+    invalid = ~status.isin(valid_statuses) | ~mode.isin(valid_modes)
+    record(
+        "order_status_and_payment_mode_validity",
+        "Validity", "Critical", len(orders), invalid.sum(),
+    )
+
+    order_issues = order_accuracy_issues(orders)
+    record(
+        "order_quantity_discount_and_amount_accuracy",
+        "Accuracy", "Critical", len(orders),
+        order_issues["row_key"].nunique(),
+    )
+
+    products = datasets["products"]
+    product_issues = product_pricing_issues(products)
+    record(
+        "product_pricing_accuracy",
+        "Accuracy", "Critical", len(products),
+        product_issues["row_key"].nunique(),
+    )
+
+
+    # Reconcile curated payments against curated orders.
+    # Quarantined source records remain available for auditing but must
+    # not cause curated-data validation checks to fail.
+    orders = datasets["orders"]
+    payments = datasets["payments"]
+
+    reconciliation = payment_reconciliation_issues(payments, orders)
+
+    successful = (
+        payments["payment_status"]
+        .astype("string")
+        .str.strip()
+        .str.upper()
+        .eq("SUCCESS")
+    )
+    successful_payments = payments.loc[successful].copy()
+
+    order_keys = set(
+        orders["order_id"].dropna().astype("string").str.strip()
+    )
+    payment_order_keys = (
+        successful_payments["order_id"].astype("string").str.strip()
+    )
+
+    has_order_reference = (
+        successful_payments["order_id"].notna()
+        & payment_order_keys.ne("")
+        & payment_order_keys.isin(order_keys)
+    )
+
+    reference_issues = successful_payments.loc[~has_order_reference]
+
+    amount_issues = reconciliation.loc[
+        reconciliation["problem"].str.startswith(
+            "Successful payment amount", na=False
+        )
+    ]
+
+    record(
+        "successful_payment_amount_reconciliation",
+        "Consistency",
+        "Critical",
+        int(has_order_reference.sum()),
+        int(amount_issues["row_key"].nunique()),
+    )
+    record(
+        "successful_payment_order_reference",
+        "Consistency",
+        "Critical",
+        len(successful_payments),
+        int(reference_issues["payment_id"].nunique()),
+    )
+
+
+    # Timeliness checks.
+    now = pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
+    order_ts = pd.to_datetime(orders["order_ts"], errors="coerce", format="mixed")
+    if order_ts.dt.tz is not None:
+        order_ts = order_ts.dt.tz_localize(None)
+    record(
+        "future_order_timestamp",
+        "Timeliness", "Critical", len(orders), (order_ts > now).sum(),
+    )
+
+
+    latest = order_ts.max()
+    is_stale = pd.notna(latest) and latest < now - pd.Timedelta(days=1)
+    record(
+        "latest_order_freshness",
+        "Timeliness", "Warning", 1, int(is_stale),
+    )
+
+    frame = write_dq_results(results, str(OUTPUT_DIR / "dq_results.csv"))
+
+    from include.nammamart.audit import persist_dq_results
+    persist_dq_results(results)
+
+    return frame
 
 
 def build_quality_report() -> pd.DataFrame:

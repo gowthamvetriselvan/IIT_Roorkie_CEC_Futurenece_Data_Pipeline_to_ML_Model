@@ -22,3 +22,16 @@ __pycache__/
 # Generated NammaMart ETL outputs
 include/output/nammamart/
 include/output/nammamart_elt/
+
+# Generated pipeline outputs, audit databases and potentially sensitive CSVs
+include/output/
+
+# macOS AppleDouble metadata
+._*
+
+# Local working backups
+*.bak
+*.before_audit
+*.before_idempotency_*
+*.before_sql_*
+*.pre_raw_layer_backup*
