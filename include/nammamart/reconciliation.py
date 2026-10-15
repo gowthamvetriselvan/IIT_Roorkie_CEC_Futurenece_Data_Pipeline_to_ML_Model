@@ -18,14 +18,17 @@ SOURCE_FILES = [
 ]
 
 
-def get_source_reconciliation_metrics() -> dict[str, int]:
+def get_source_reconciliation_metrics(
+    source_dir: Path | None = None,
+) -> dict[str, int]:
     """Count physical source rows, exact duplicates and superseded orders."""
     frames = {}
     rows_extracted = 0
     rows_deduplicated = 0
+    input_dir = source_dir or SOURCE_DIR
 
     for filename in SOURCE_FILES:
-        path = SOURCE_DIR / filename
+        path = input_dir / filename
         if not path.is_file():
             raise FileNotFoundError(path)
 

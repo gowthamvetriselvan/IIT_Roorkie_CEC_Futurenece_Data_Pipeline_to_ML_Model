@@ -15,7 +15,7 @@ Two Airflow pipelines were implemented over the NammaMart dataset:
 
 Both scheduled runs on 15 October 2026 succeeded, and subsequent manual verification runs of both DAGs also succeeded. The new manual runs report **5,372 physical source rows, 4,599 loaded, 747 quarantined, 16 exact duplicate rows, and 10 superseded order versions**. The counters now reconcile source rows explicitly while preserving the older scheduled-run records as historical audit evidence. The latest ELT DQ run contained 23 checks: 19 PASS and 4 Warning-level FAIL. All Critical checks passed.
 
-**Recommendation:** adopt ELT as the primary analytics pattern, with strict Critical-quality gates before curated finance marts are exposed. The latest ELT run took about 27 minutes and completed after the 09:30 IST target, so the reporting SLA still needs performance work.
+**Recommendation:** adopt ELT as the primary analytics pattern, with strict Critical-quality gates before curated finance marts are exposed. The 15 October scheduled ELT observation took about 27 minutes and completed after the 09:30 IST target; later manual verification succeeded but was not timed, so the reporting SLA still needs performance work.
 
 ## 2. Input data
 
@@ -281,9 +281,9 @@ This is a useful logical dictionary, but final submission should attach actual `
 
 ### Lineage: what can and cannot be proven from current evidence
 
-**ETL lineage:** source CSV → Python extraction/validation → passed rows into curated fact/dimensions → mart/report; rejected rows go to quarantine with a reason. The `source_file` field is carried through order transformations, but the current report does not include a captured exact row-level trace from a source line to a single `mart_daily_store_kpis` aggregate.
+**ETL lineage:** source CSV → run-scoped extraction → Python validation/curation → `etl_fact_orders` → `etl_daily_zone_revenue`; rejected rows go to quarantine with a reason. An accepted-order fact-to-aggregate trace is now verified for `ORD002401` (2026-10-01, store S14, NammaMart Vijayanagar, West): fact net revenue 475.95; matching daily/store aggregate has 12 delivered orders and net revenue 5,453.90. The exact original CSV row/line and a separate ELT raw-to-mart contribution trace are still not evidenced.
 
-**ELT lineage:** source CSV → `raw_*` (with `_source_file`, `_run_id`, `_loaded_at`) → SQL staging/upsert → mart. This is easier to audit because raw values and source-file metadata remain queryable. To complete the assignment's exact lineage proof, capture one specific September `mart_daily_store_kpis` number, list its contributing delivered order IDs, show each source file and row, and show the SQL aggregation. That query output is **not present in the current evidence pack**.
+**ELT lineage:** source CSV → `raw_*` (with `_source_file`, `_run_id`, `_loaded_at`) → SQL staging/upsert → mart. Raw/source metadata supports auditability. The accepted-order trace above verifies the ETL fact-to-aggregate link only; a separate ELT raw-to-mart trace with contributing order IDs and source-file lineage remains open.
 
 ### Personal data, masking and Indian law
 
@@ -309,7 +309,7 @@ No credential should be hard-coded in a DAG, committed to GitHub, printed in tas
 
 ### Rejected-order audit example
 
-The available test output names `ORD000500` as an order rejected for `invalid_order_status`. Use this as the example to demonstrate the audit path, but the current pack does not include the full raw record or a query proving absence from the finance fact table. Capture these queries against the current environment before claiming the end-to-end proof:
+`ORD000500` is the rejected-order example. The ETL query returned `finance_fact_rows = 0`, proving that it is absent from `etl_fact_orders` in the queried database state. The ELT quarantine query returned `ORD000500 | invalid_order_status`. The accepted-order ETL fact-to-aggregate trace for `ORD002401` is also now captured. The remaining lineage gap is the original source-row/line and ELT raw-to-mart trace, not the ETL fact-to-aggregate join. The following are historical capture commands; their outputs are already recorded in the later evidence addenda where available:
 
 ```sql
 -- ELT: exact raw source version(s); avoid exporting PII if customer data is joined.
@@ -328,7 +328,61 @@ FROM etl_fact_orders
 WHERE order_id = 'ORD000500';
 ```
 
-The expected fact count is zero for a critical rejected order. If the current table names differ, use `SHOW TABLES` / `DESCRIBE` and substitute the actual table name. Save the query outputs in the evidence appendix.
+Observed ETL result: `finance_fact_rows = 0`. The ELT quarantine query is now captured: `ORD000500` has reason `invalid_order_status` in `orders_quarantine`. If the current ELT table names differ, use `SHOW TABLES` / `DESCRIBE` and substitute the actual table name. Save both outputs in the evidence report. The accepted-order ETL fact-to-aggregate trace is now captured; exact source CSV row/line and ELT raw-to-mart trace remain open.
+
+### Remaining `ORD000500` and lineage capture commands
+
+Run inside the Astro container. First confirm the actual table names; use `DESCRIBE` if a query fails.
+
+```bash
+duckdb include/output/nammamart_elt/nammamart_elt.duckdb
+```
+
+```sql
+SHOW TABLES;
+SELECT order_id, quarantine_reason, source_file
+FROM orders_quarantine
+WHERE order_id = 'ORD000500';
+
+DESCRIBE mart_daily_store_kpis;
+DESCRIBE mart_category_margin;
+DESCRIBE mart_delivery_sla;
+DESCRIBE mart_payment_reconciliation;
+DESCRIBE mart_top_customers;
+```
+
+Then query the ETL database and retain the already verified exclusion result:
+
+```bash
+duckdb include/warehouse_gowtham.duckdb
+```
+
+```sql
+SELECT COUNT(*) AS finance_fact_rows
+FROM etl_fact_orders
+WHERE order_id = 'ORD000500';
+
+DESCRIBE etl_fact_orders;
+DESCRIBE etl_daily_zone_revenue;
+```
+
+A complete lineage trace needs the actual `order_id`/business key, the relevant fact row (if accepted), and the aggregate row it contributes to. For a quarantined order such as `ORD000500`, the expected ETL fact count is zero, so do not invent a contribution to a mart. Capture a separate example of a curated order to trace a real source amount through the fact and its reporting aggregate.
+
+### Verified ETL warehouse schemas — 15 October 2026
+
+The user-provided DuckDB `DESCRIBE` output confirms these columns.
+
+`etl_fact_orders`:
+- Identifiers/time: `order_id`, `order_ts`, `customer_id`, `store_id`, `product_id`, `order_date`, `run_id`
+- Order values: `quantity`, `unit_price`, `discount_pct`, `order_amount`, `payment_mode`, `order_status`, `channel`, `delivery_minutes`
+- Source audit: `source_file`, `source_order_status`, `source_payment_mode`
+- Enrichment/metrics: `category`, `cost_price`, `store_name`, `zone`, `net_revenue`, `gross_margin`, `within_15_min`
+
+`etl_daily_zone_revenue`:
+- Grouping keys: `order_date`, `zone`, `store_id`, `store_name`
+- Measures: `delivered_orders`, `net_revenue`
+
+The rejected-order query returned `finance_fact_rows = 0` for `ORD000500`. The accepted-order trace now establishes that `ORD002401` contributes fact net revenue 475.95 to the 1 October 2026 aggregate for store S14; that aggregate contains 12 delivered orders and total net revenue 5,453.90. The original CSV row/line and ELT raw-to-mart trace remain unverified.
 
 ### Change history: DELIVERED on 3 September, RETURNED on 1 October
 
@@ -538,7 +592,7 @@ ORDER BY source_file, rejected_rows DESC;
 
 I recommend **ELT as the primary analytics platform, with strict Critical-quality gates before curated finance marts are published**. ELT retains raw inputs for replay and audit while moving transformations into SQL, making rules easier to inspect and evolve. The scheduled ETL and ELT runs succeeded; after the reconciliation change, fresh manual runs of both pipelines also succeeded with 5,372 extracted, 4,599 loaded, 747 quarantined, 16 deduplicated, and 10 superseded. All Critical ELT DQ checks passed; four Warning checks were logged.
 
-ETL remains useful where fast pre-warehouse validation is important. In the observed run, ETL took about five seconds and ELT about 27 minutes. This is not a controlled benchmark, but ELT completed after the 09:30 leadership stand-up target. Before production adoption, we should profile task-level timings, optimize SQL and incremental processing, and schedule with enough lead time.
+ETL remains useful where fast pre-warehouse validation is important. The 15 October scheduled observation was approximately 5.23 seconds for ETL and 27 minutes 13.52 seconds for ELT; ELT completed after the 09:30 leadership stand-up target. Later manual verification runs succeeded, but their elapsed times were not captured, so they cannot be used to claim a performance improvement. This is a single scheduled observation, not a controlled benchmark. Before production adoption, profile task-level timings, optimize SQL and incremental processing, and schedule with enough lead time.
 
 Finance users must never consume raw or quarantined data. Reconciliation should distinguish successful matching payments, no successful payment, quarantined orders, and amount mismatches; missing payments should not be presented as proven gateway losses. At 1,000× growth, benchmark throughput, concurrency, and recovery, and consider a managed warehouse only if measured requirements justify the added cost.
 
@@ -549,7 +603,7 @@ Finance users must never consume raw or quarantined data. Reconciliation should 
 
 ## 11. Tests and parity checks
 
-- Python test suite: **30 passed** (`pytest -q -p no:cacheprovider`).
+- Python test suite: **32 passed** (`pytest -q -p no:cacheprovider`, latest reported run) (`pytest -q -p no:cacheprovider`).
 - Latest scheduled ETL run: SUCCESS.
 - Latest scheduled ELT run: SUCCESS.
 - Latest manual ETL and ELT runs both recorded 5,372 extracted, 4,599 loaded, 747 quarantined, 16 deduplicated, and 10 superseded; both statuses were SUCCESS.
@@ -567,22 +621,25 @@ Finance users must never consume raw or quarantined data. Reconciliation should 
 The following items are **not complete based on the evidence currently available**. They should remain visible as open items rather than be represented as completed:
 
 1. **Part 0:** full per-column profiling for all six files (null counts, duplicate keys, numeric/date min/max, distinct category values), and complete referential-integrity/business-rule check outputs.
-2. **Part E:** an exact source-row-to-mart number trace with query output; raw rejected record and proof it is absent from the ETL finance fact; actual DuckDB `DESCRIBE` output for the data dictionary.
-3. **Part F:** controlled experiments 4–10, plus evidence for experiments 1–3 on both DAGs, with run IDs, task states, logs, DQ output and before/after row counts.
+2. **Part E:** ETL exclusion of `ORD000500` (`COUNT(*) = 0`), ELT quarantine reason (`invalid_order_status`), actual ETL table schemas, and accepted-order ETL fact-to-aggregate trace for `ORD002401` are verified. Still open: original source CSV row/line provenance and a separate ELT raw-to-mart trace.
+3. **Part F:** function-level missing-file and schema-mismatch tests, the isolated 50-order case, and the 100× price experiment are now documented. Still open: stale-data test; Clear/recovery; alert delivery; and running the corresponding controlled tests against the ELT DAG with task states, logs, DQ output, and before/after counts. Do not describe the entire experiment matrix as complete.
 4. **Business questions:** Q1 full 415-row output, Q3 full 14-store output, Q5 actual top-ten spend values, and Q6 current-run counts by every entity/file and reason.
 5. **Change history:** exact September revenue impact for the ten returned orders, ideally comparing “as originally reported” with “latest corrected”; only the status updates are currently evidenced.
 6. **Audit history distinction:** fresh manual runs verify explicit `rows_deduplicated` and `rows_superseded` counters. Historical scheduled records still show the earlier 5,346 metric and should remain unchanged; use fresh-run records for the corrected reconciliation.
 
 ## 13. Screenshot and final submission checklist
 
-- [ ] ETL Graph view: successful run with all tasks green.
-- [ ] ELT Graph view: successful run with all tasks green.
+- [ ] ETL Graph view: retain screenshot of successful run with all tasks green.
+- [ ] ELT Graph view: retain screenshot of successful run with all tasks green.
 - [ ] Schedule evidence: `0 9 * * 1-6`, timezone `Asia/Kolkata`.
 - [ ] Aggregate quarantine summary without customer-level PII.
-- [ ] `dq_results` output for latest ELT run (23 checks).
+- [ ] Capture `dq_results` output for the latest ELT run and label it with its run ID; the older supplied ELT snapshot had 23 checks, while the latest ETL DQ output had 30 checks.
 - [ ] `pipeline_runs` output for both successful scheduled runs.
 - [ ] `mart_payment_reconciliation` summary.
 - [ ] `payments_quarantine` reason summary.
+- [x] ELT `orders_quarantine` query result for `ORD000500` (`invalid_order_status`).
+- [x] Accepted-order ETL fact-to-aggregate trace (`ORD002401`; fact revenue 475.95; aggregate 12 orders / 5,453.90).
+- [ ] Original source CSV row/line provenance and separate ELT raw-to-mart trace.
 - [ ] Q1 full result output (415 date/store keys).
 - [ ] Q2 category margin output (7 rows).
 - [ ] Q3 delivery SLA output (14 stores).
@@ -614,4 +671,129 @@ DESCRIBE mart_top_customers;
 - Fresh manual ETL run `manual__2026-10-15T08:38:23.580596+00:00`: SUCCESS; 5,372 extracted, 4,599 loaded, 747 quarantined, 16 deduplicated, 10 superseded.
 - Fresh manual ELT run `manual__2026-10-15T08:38:19.022844+00:00`: SUCCESS with the same counts.
 - The earlier scheduled-run audit rows are historical and remain unchanged at 5,346 extracted with zeroes in the newly added counters.
-- This update verifies reconciliation metrics; the outstanding assignment deliverables listed above remain open and should not be represented as completed.
+- This historical entry records the state at that time. The later controlled-test sections and the updated Part 12 checklist below record additional evidence collected on 15 October 2026; remaining gaps are still explicitly listed.
+
+---
+
+**Date:** 15 October 2026
+**Purpose:** Consolidated assignment submission, including the original implementation/run history and the latest controlled-test evidence. Historical run records remain distinct; outstanding requirements are explicitly identified.
+
+## 15. Controlled observability tests — 15 October 2026
+
+### 1.1 Missing source file
+A direct isolated invocation of the existing `_extract_group()` function used the deliberately nonexistent filename `missing_file_test_only.csv`.
+
+- **Expected:** `FileNotFoundError`
+- **Observed:** `FileNotFoundError: Required source file is missing: /usr/local/airflow/include/data/nammamart/missing_file_test_only.csv`
+- **Result:** PASS
+- **Scope:** Function-level test only. It did not trigger an Airflow task, retry, or alert.
+- **Safety:** Original source files and warehouse were not modified.
+
+### 1.2 Schema mismatch
+The actual `validate_extractions` Python callable was invoked with a temporary run directory containing copies of the six source files. The `email` column was removed from the temporary `customers.csv`.
+
+- **Expected:** Reject the altered schema before transformation.
+- **Observed:** `Schema mismatch in customers.csv; missing=['email'], unexpected=[]`
+- **Result:** PASS
+- **Safety:** Original source files and warehouse were not modified.
+
+### 1.3 Isolated 50-order transformation and validation
+A temporary fixture selected 50 distinct base order IDs, retained the reference datasets, and used an empty temporary incremental order file. The existing `transform_orders()` and `validate_orders()` functions were called directly. No ETL output writer, warehouse loader, or Airflow DAG run was invoked.
+
+| Stage | Rows |
+|---|---:|
+| Selected distinct source order IDs | 50 |
+| Rejected by `transform_orders()` | 1 |
+| Transformed orders passed to validation | 49 |
+| Curated orders | 40 |
+| Rejected during validation | 9 |
+| **Total accounted for** | **50** |
+
+The initial rejection was `ORD001812`, with payment mode `Cashh`, reason `invalid_payment_mode`. The nine validation-quarantined rows had ten reason occurrences because one row had both `orphan_customer_id` and `orphan_store_id`. Initial and validation quarantine IDs did not overlap. The total reconciles: 40 + 9 + 1 = 50.
+
+- **Result:** PASS for isolated transformation/validation and count reconciliation.
+- **Safety:** Original CSVs and warehouse were not modified.
+- **Limitation:** This does not prove full Airflow DAG recovery, retry behaviour, or alert delivery.
+
+### 1.4 100× unit-price anomaly experiment
+An in-memory copy of a valid order was used; no source file or warehouse table was changed. The selected order was `ORD001913`, with original `unit_price=222.00` and `order_amount=421.80`.
+
+| Experiment | Mutation | Observed result |
+|---|---|---|
+| A | Multiply `unit_price` by 100, leave `order_amount` unchanged | Critical Accuracy issue: `Order amount does not match the required formula` |
+| B | Multiply `unit_price` by 100 and recompute `order_amount` consistently | No issue detected |
+
+**Interpretation:** The current `order_accuracy_issues()` rule checks consistency between quantity, unit price, discount, and order amount. It detects the inconsistent amount in Experiment A, but does not independently identify an unusually high unit price if the amount is recalculated consistently (Experiment B). Therefore, an independent price-outlier rule is a documented gap; do not claim that current checks catch every 100× price anomaly.
+
+## 16. ETL warehouse schema and integrity verification
+
+The ETL warehouse inspection returned these reporting table counts:
+
+| Table | Rows |
+|---|---:|
+| `etl_daily_zone_revenue` | 429 |
+| `etl_category_margin` | 7 |
+| `etl_payment_reconciliation` | 604 |
+
+The `DESCRIBE etl_fact_orders` output showed the fact table includes the order identifiers, source status/payment mode, derived date/category/cost/store/zone fields, net revenue, gross margin, delivery KPI, and `run_id`.
+
+A joined integrity query returned:
+
+| Check | Count |
+|---|---:|
+| Fact rows | 2,177 |
+| Distinct order IDs | 2,177 |
+| Missing customer dimension matches | 0 |
+| Missing product dimension matches | 0 |
+| Missing store dimension matches | 0 |
+
+The query `SELECT COUNT(*) FROM etl_fact_orders WHERE order_id = 'ORD000500'` returned `0`, proving absence from the ETL finance fact in the queried database state. The actual ELT quarantine query output is still required before claiming the full cross-pipeline audit path.
+
+## 17. Part F verification status
+
+| Experiment/control | Status |
+|---|---|
+| Missing source file detection | Verified at function level |
+| Schema mismatch rejection | Verified by actual validator callable |
+| Controlled 50-order validation | Verified; counts reconcile |
+| 100× price anomaly | Partially detected; independent outlier detection gap identified |
+| Full Airflow task failure/retry/recovery | Not yet verified |
+| Alert delivery for injected failures | Not yet verified |
+| Stale 30-day data experiment | Not yet verified |
+| Clear/recovery experiment for both DAGs | Not yet verified |
+| Full controlled experiment matrix for both ETL and ELT | Not complete |
+
+## 18. Final evidence limitations
+
+Use the terminal outputs as evidence for the specific tests above. Do not state that all Part F observability tests are complete. Keep earlier scheduled and manual run IDs, timings, and audit metrics unchanged; this addendum records new isolated tests rather than rewriting historical run results.
+
+Previously documented outstanding deliverables, including full business-query outputs, current-run quarantine breakdowns, and the remaining controlled observability experiments. Preserve those open items until evidence is collected.
+
+
+## 19. Final assignment-gap review — evidence collected 15 October 2026
+
+This section is the final review against evidence actually supplied in the terminal conversation. It supersedes earlier statements that the accepted-order ETL fact-to-aggregate trace, ELT rejected-order proof, and final automated test/parse results were still pending. Historical sections are retained for audit chronology.
+
+### Newly verified
+
+- **Accepted-order ETL fact-to-aggregate lineage:** `ORD002401`, 2026-10-01, S14 / NammaMart Vijayanagar / West. `etl_fact_orders.net_revenue = 475.95`; the join on `order_date` and `store_id` matched `etl_daily_zone_revenue` with `delivered_orders = 12` and aggregate `net_revenue = 5453.90`.
+- **Rejected order:** `ORD000500` is absent from `etl_fact_orders` (`finance_fact_rows = 0`) and appears in ELT `orders_quarantine` with `invalid_order_status`.
+- **Application tests:** `pytest -q -p no:cacheprovider` → **32 passed in 2.15s**.
+- **DAG integrity:** `astro dev parse` → **4 passed in 1.20s**, `No errors detected in your Dags`.
+- **Repository check:** `git diff --check` still reports three trailing-whitespace lines: `EVIDENCE.md` lines 263–264 and `SUBMISSION.md` line 661. This is a documentation hygiene issue, not a pipeline test failure.
+- **Repository inventory:** `include/nammamart/etl_warehouse.py` (302 lines) and `tests/test_nammamart_etl_warehouse.py` (97 lines) are untracked and appear to be required implementation/test files. Several `.bak` / `.before_*` files and generated DuckDB/CSV artifacts are also untracked; classify them before staging. `include/output/etl_extracts/`, `include/output/nammamart/`, and `include/output/nammamart_elt/` are ignored, but some top-level generated artifacts under `include/output/` are not ignored. No source-data changes were reported by `git status --short -- include/data`.
+- **Test warning:** Astro's integrity pytest emitted a cache permission warning for `/.pytest_cache`; all four DAG integrity tests passed. Record the warning accurately rather than treating it as a DAG parse failure.
+
+### Remaining gaps — do not claim complete
+
+1. **Part 0 profiling:** full per-column null counts, duplicate business-key counts, numeric/date ranges, all distinct category values, complete relationship checks, and full business-rule profiling are not all in the evidence pack.
+2. **Business questions:** full Q1 415-row result, Q3 14-store result, Q5 top-ten spend values, and Q6 current-run quarantine counts by entity/file/reason remain outstanding. Q2 has seven category rows documented; Q4 populations must remain clearly distinguished.
+3. **Observability:** missing-file and schema-mismatch checks are function-level/callable tests, not full Airflow failure/retry/alert tests. The 50-order and 100× price experiments are isolated function-level tests. Stale 30-day data, Clear/recovery on both DAGs, alert delivery, and the full prescribed controlled matrix on both DAGs remain incomplete. An independent price-outlier check is not implemented/evidenced when price and amount are changed consistently.
+4. **Lineage:** accepted-order ETL fact-to-aggregate link is now verified. Exact original CSV row/line provenance and a separate ELT raw-to-mart trace remain outstanding.
+5. **Repository hygiene:** three trailing-whitespace issues remain in `SUBMISSION.md` / `EVIDENCE.md`; untracked backup and generated artifact files need classification. No deletion or staging was performed as part of this review.
+6. **Governance:** retention durations in the report are proposals, not approved policy; actual Slack alert delivery and external secrets backend configuration have not been demonstrated.
+7. **Performance:** the 27m13.52s ELT result is one historical scheduled observation and missed the 09:30 target. Later manual runs succeeded but elapsed time was not captured; do not claim a performance improvement.
+
+### Final review conclusion
+
+The pipeline implementation has positive execution evidence (32 application tests, four Astro DAG integrity tests, successful ETL/ELT runs, quarantine proof, and an accepted-order ETL aggregate trace). The assignment is **not fully evidenced end-to-end** until the outstanding profiling/business-query outputs and prescribed Airflow observability experiments are either completed or explicitly accepted as limitations. Do not push or claim all rubric items complete on the basis of this review alone.

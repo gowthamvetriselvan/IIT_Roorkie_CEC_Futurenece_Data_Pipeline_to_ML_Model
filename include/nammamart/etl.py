@@ -1,6 +1,7 @@
 """Reusable CSV and Parquet output helpers for NammaMart ETL."""
 
 from pathlib import Path
+import re
 
 import pandas as pd
 
@@ -10,14 +11,44 @@ SOURCE_DIR = PROJECT_ROOT / "include" / "data" / "nammamart"
 OUTPUT_DIR = PROJECT_ROOT / "include" / "output" / "nammamart"
 
 
-def read_source_csv(filename: str) -> pd.DataFrame:
-    """Read an input CSV without modifying the source file."""
-    path = SOURCE_DIR / filename
+def read_source_csv(
+    filename: str, source_dir: Path | None = None
+) -> pd.DataFrame:
+    """Read an input CSV without modifying the source file.
+
+    ``source_dir`` lets Airflow tasks process the immutable, run-scoped copies
+    created by the parallel extraction tasks.
+    """
+    path = (source_dir or SOURCE_DIR) / filename
 
     if not path.is_file():
         raise FileNotFoundError(f"Source CSV not found: {path}")
 
     return pd.read_csv(path, dtype="string", keep_default_na=True)
+
+
+def _mask_email_value(value) -> str | None:
+    if pd.isna(value) or not str(value).strip():
+        return None
+    text = str(value).strip()
+    if "*" in text:
+        return text
+    if "@" not in text:
+        return "***"
+    local, domain = text.split("@", 1)
+    return f"{local[:2]}***@{domain}" if local else f"***@{domain}"
+
+
+def _mask_phone_value(value) -> str | None:
+    if pd.isna(value) or not str(value).strip():
+        return None
+    text = str(value).strip()
+    if "*" in text:
+        return text
+    digits = "".join(char for char in text if char.isdigit())
+    if len(digits) < 4:
+        return "*" * max(len(digits), 4)
+    return f"{digits[:2]}{'*' * max(len(digits) - 4, 4)}{digits[-2:]}"
 
 
 def write_dataset(df: pd.DataFrame, dataset_name: str) -> dict[str, str]:
@@ -75,9 +106,11 @@ def _split_conflicting_keys(
 
 
 
-def transform_customers() -> tuple[pd.DataFrame, pd.DataFrame]:
+def transform_customers(
+    source_dir: Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Clean customers and quarantine critical timestamp/key failures."""
-    df = read_source_csv("customers.csv").drop_duplicates().copy()
+    df = read_source_csv("customers.csv", source_dir).drop_duplicates().copy()
 
     clean, key_quarantine = _split_conflicting_keys(df, "customer_id")
 
@@ -107,15 +140,24 @@ def transform_customers() -> tuple[pd.DataFrame, pd.DataFrame]:
         sort=False,
     )
 
+    # Mask customer contact fields in curated ETL outputs. Raw values remain
+    # only in the original source file and the access-restricted quarantine.
+    if "email" in clean.columns:
+        clean["email"] = clean["email"].map(_mask_email_value)
+    if "phone" in clean.columns:
+        clean["phone"] = clean["phone"].map(_mask_phone_value)
+
     return clean, quarantine
 
 
 
-def transform_products() -> tuple[pd.DataFrame, pd.DataFrame]:
+def transform_products(
+    source_dir: Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Clean products and quarantine key conflicts and invalid pricing."""
     from include.nammamart.quality import product_pricing_issues
 
-    df = read_source_csv("products.csv").drop_duplicates().copy()
+    df = read_source_csv("products.csv", source_dir).drop_duplicates().copy()
 
     clean, key_quarantine = _split_conflicting_keys(df, "product_id")
 
@@ -225,10 +267,12 @@ def normalize_order_values(
     return clean, invalid
 
 
-def transform_orders() -> tuple[pd.DataFrame, pd.DataFrame]:
+def transform_orders(
+    source_dir: Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Deduplicate base orders and upsert the incremental order file."""
-    base = read_source_csv("orders.csv")
-    incremental = read_source_csv("orders_2026-10-01_increment.csv")
+    base = read_source_csv("orders.csv", source_dir)
+    incremental = read_source_csv("orders_2026-10-01_increment.csv", source_dir)
 
     base["source_file"] = "orders.csv"
     incremental["source_file"] = "orders_2026-10-01_increment.csv"
@@ -340,9 +384,10 @@ def transform_orders() -> tuple[pd.DataFrame, pd.DataFrame]:
 def transform_payments(
     valid_order_ids: set[str],
     order_amounts: pd.DataFrame | None = None,
+    source_dir: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Deduplicate payments and quarantine invalid references or amounts."""
-    df = read_source_csv("payments.csv").drop_duplicates().copy()
+    df = read_source_csv("payments.csv", source_dir).drop_duplicates().copy()
     quarantine_parts = []
 
     # Identify missing payment IDs.
@@ -455,9 +500,11 @@ def transform_payments(
     return clean, quarantine
 
 
-def transform_stores() -> tuple[pd.DataFrame, pd.DataFrame]:
+def transform_stores(
+    source_dir: Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Clean stores and quarantine conflicting keys or invalid capacity."""
-    df = read_source_csv("stores.csv").drop_duplicates().copy()
+    df = read_source_csv("stores.csv", source_dir).drop_duplicates().copy()
 
     clean, quarantine = _split_conflicting_keys(df, "store_id")
 
@@ -648,23 +695,38 @@ def validate_orders(
     curated = df.loc[~quarantine_mask].copy()
     return curated, quarantined
 
-def run_etl(run_id: str | None = None) -> dict[str, dict[str, str]]:
-    """Run all transformations and persist curated and quarantine outputs."""
-    customers, customers_q = transform_customers()
-    products, products_q = transform_products()
-    stores, stores_q = transform_stores()
+def run_etl(
+    run_id: str | None = None,
+    source_dir: Path | None = None,
+) -> dict[str, dict[str, str]]:
+    """Run all transformations and persist curated and quarantine outputs.
 
-    orders, orders_initial_q = transform_orders()
+    If ``source_dir`` is supplied, all input comes from the immutable copies
+    produced by the DAG extraction tasks.
+    """
+    customers, customers_q = transform_customers(source_dir)
+    products, products_q = transform_products(source_dir)
+    stores, stores_q = transform_stores(source_dir)
+
+    orders, orders_initial_q = transform_orders(source_dir)
     orders, orders_validation_q = validate_orders(
         orders, customers, products, stores
     )
 
     # Payments must reference orders that survive validation.
     payments, payments_q = transform_payments(
-    set(orders["order_id"].astype(str)),
-    orders[["order_id", "order_amount"]],
+        set(orders["order_id"].astype(str)),
+        orders[["order_id", "order_amount"]],
+        source_dir=source_dir,
     )
 
+    if run_id is None:
+        from include.nammamart.dq_results import new_run_id
+        run_id = new_run_id()
+
+    orders_quarantine = pd.concat(
+        [orders_initial_q, orders_validation_q], ignore_index=True, sort=False
+    )
     outputs = {
         "customers": write_dataset(customers, "customers"),
         "customers_quarantine": write_dataset(customers_q, "customers_quarantine"),
@@ -673,23 +735,40 @@ def run_etl(run_id: str | None = None) -> dict[str, dict[str, str]]:
         "stores": write_dataset(stores, "stores"),
         "stores_quarantine": write_dataset(stores_q, "stores_quarantine"),
         "orders": write_dataset(orders, "orders"),
-        "orders_quarantine": write_dataset(
-            pd.concat([orders_initial_q, orders_validation_q], ignore_index=True),
-            "orders_quarantine",
-        ),
+        "orders_quarantine": write_dataset(orders_quarantine, "orders_quarantine"),
         "payments": write_dataset(payments, "payments"),
         "payments_quarantine": write_dataset(payments_q, "payments_quarantine"),
     }
 
-    if run_id is None:
-        from include.nammamart.dq_results import new_run_id
-        run_id = new_run_id()
+    # Assignment-required run-scoped quarantine CSVs with a standard reason field.
+    quarantine_dir = PROJECT_ROOT / "include" / "quarantine" / "gowtham"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_id)).strip("_.")
+    quarantine_frames = {
+        "customers": customers_q,
+        "products": products_q,
+        "stores": stores_q,
+        "orders": orders_quarantine,
+        "payments": payments_q,
+    }
+    for dataset_name, failed_rows in quarantine_frames.items():
+        failed = failed_rows.copy()
+        if "quarantine_reason" in failed.columns:
+            failed = failed.rename(columns={"quarantine_reason": "failure_reason"})
+        elif "failure_reason" not in failed.columns:
+            failed["failure_reason"] = "unspecified_validation_failure"
+        failed.to_csv(
+            quarantine_dir / f"{dataset_name}_failed_{safe_run_id}.csv",
+            index=False,
+        )
 
-    build_dq_results(run_id=run_id)
+    build_dq_results(run_id=run_id, source_dir=source_dir)
     return outputs
 
 
-def build_dq_results(run_id: str | None = None) -> pd.DataFrame:
+def build_dq_results(
+    run_id: str | None = None, source_dir: Path | None = None
+) -> pd.DataFrame:
     """Write standardized run-level data-quality results for ETL."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
@@ -757,16 +836,18 @@ def build_dq_results(run_id: str | None = None) -> pd.DataFrame:
 
     # Customer contact validity and loyalty-tier consistency.
     customers = datasets["customers"]
-    customer_issues = customer_validity_issues(customers)
+    customer_source = read_source_csv("customers.csv", source_dir)
+    customer_issues = customer_validity_issues(customer_source)
 
-    # Completeness is distinct from email format validity.
-    email_values = customers["email"].astype("string").str.strip()
+    # Contact checks use source values before masking; published curated data
+    # contains masked values by design.
+    email_values = customer_source["email"].astype("string").str.strip()
     missing_emails = email_values.isna() | email_values.eq("")
     record(
         "customer_email_completeness",
         "Completeness",
         "Warning",
-        len(customers),
+        len(customer_source),
         int(missing_emails.sum()),
     )
 
@@ -786,7 +867,7 @@ def build_dq_results(run_id: str | None = None) -> pd.DataFrame:
             check_name,
             dimension,
             "Warning",
-            len(customers),
+            len(customer_source),
             failed,
         )
         # Timestamp parsing validity.

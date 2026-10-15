@@ -24,6 +24,8 @@ def test_customer_and_product_cleaning():
     assert len(customers) == 392
     assert len(customers_q) == 13
     assert customers["customer_id"].is_unique
+    assert customers["email"].dropna().astype(str).str.contains(r"\*", regex=True).all()
+    assert customers["phone"].dropna().astype(str).str.contains(r"\*", regex=True).all()
 
     assert len(products) == 143
     assert len(products_q) == 9
@@ -145,6 +147,15 @@ def test_complete_etl_outputs_and_quality_report():
     report = build_quality_report()
     assert len(report) == 5
     assert report["business_key_unique"].all()
+
+    # The assignment-required quarantine files are run-scoped and expose a
+    # consistent failure_reason column, while generated outputs stay ignored.
+    from pathlib import Path
+    from include.nammamart.etl import PROJECT_ROOT
+    quarantine_files = list((PROJECT_ROOT / "include" / "quarantine" / "gowtham").glob("orders_failed_*.csv"))
+    assert quarantine_files
+    latest_quarantine = pd.read_csv(sorted(quarantine_files, key=lambda p: p.stat().st_mtime)[-1])
+    assert "failure_reason" in latest_quarantine.columns
 
     for name in [
         "customers",
